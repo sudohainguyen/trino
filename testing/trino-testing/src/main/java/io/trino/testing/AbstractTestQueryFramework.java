@@ -68,6 +68,9 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -80,6 +83,7 @@ import static io.trino.execution.StageInfo.getAllStages;
 import static io.trino.execution.querystats.PlanOptimizersStatsCollector.createPlanOptimizersStatsCollector;
 import static io.trino.sql.SqlFormatter.formatSql;
 import static io.trino.sql.planner.OptimizerConfig.JoinReorderingStrategy;
+import static io.trino.testing.ThreadAssertions.reportLeakedThreads;
 import static io.trino.testing.TransactionBuilder.transaction;
 import static io.trino.testing.assertions.Assert.assertEventually;
 import static java.lang.String.format;
@@ -96,8 +100,10 @@ import static org.junit.jupiter.api.parallel.ExecutionMode.CONCURRENT;
 public abstract class AbstractTestQueryFramework
 {
     private static final SqlParser SQL_PARSER = new SqlParser();
+    private static final AtomicInteger SEQUENCE = new AtomicInteger();
 
     private AutoCloseableCloser afterClassCloser;
+    private ThreadGroup queryRunnerThreadGroup;
     private QueryRunner queryRunner;
     private H2QueryRunner h2QueryRunner;
     private io.trino.sql.query.QueryAssertions queryAssertions;
@@ -110,7 +116,11 @@ public abstract class AbstractTestQueryFramework
         logging.setLevel("org.testcontainers", Level.WARN);
 
         afterClassCloser = AutoCloseableCloser.create();
-        queryRunner = afterClassCloser.register(createQueryRunner());
+
+        queryRunnerThreadGroup = new ThreadGroup("atqf-test-group-" + SEQUENCE.incrementAndGet());
+        try (ExecutorService executor = Executors.newCachedThreadPool(Thread.ofPlatform().group(queryRunnerThreadGroup).factory())) {
+            queryRunner = afterClassCloser.register(executor.submit(this::createQueryRunner).get());
+        }
         h2QueryRunner = afterClassCloser.register(new H2QueryRunner());
         queryAssertions = new io.trino.sql.query.QueryAssertions(queryRunner);
     }
@@ -132,6 +142,10 @@ public abstract class AbstractTestQueryFramework
             queryRunner = null;
             h2QueryRunner = null;
             queryAssertions = null;
+        }
+
+        if (queryRunnerThreadGroup != null) {
+            reportLeakedThreads(queryRunnerThreadGroup);
         }
     }
 
@@ -740,8 +754,8 @@ public abstract class AbstractTestQueryFramework
         checkState(
                 afterClassCloser != null,
                 "closeAfterClass invoked before test is initialized or after it is torn down. " +
-                        "In particular, make sure you do not allocate any resources in a test class constructor, " +
-                        "as this can easily lead to OutOfMemoryErrors and other types of test flakiness.");
+                "In particular, make sure you do not allocate any resources in a test class constructor, " +
+                "as this can easily lead to OutOfMemoryErrors and other types of test flakiness.");
         return afterClassCloser.register(resource);
     }
 }
