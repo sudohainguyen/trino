@@ -36,12 +36,16 @@ import io.trino.spi.connector.SystemTable;
 import io.trino.spi.function.table.ConnectorTableFunction;
 import io.trino.spi.procedure.Procedure;
 
+import static io.airlift.configuration.ConfigBinder.configBinder;
+
 public class SystemConnectorModule
         implements Module
 {
     @Override
     public void configure(Binder binder)
     {
+        configBinder(binder).bindConfig(SystemTablesConfig.class);
+        
         Multibinder<SystemTable> globalTableBinder = Multibinder.newSetBinder(binder, SystemTable.class);
         globalTableBinder.addBinding().to(NodeSystemTable.class).in(Scopes.SINGLETON);
         globalTableBinder.addBinding().to(QuerySystemTable.class).in(Scopes.SINGLETON);
