@@ -13,12 +13,14 @@
  */
 package io.trino.connector.system.jdbc;
 
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.airlift.slice.Slices;
 import io.trino.FullConnectorSession;
 import io.trino.Session;
 import io.trino.connector.system.SystemColumnHandle;
 import io.trino.connector.system.SystemSplit;
+import io.trino.connector.system.SystemTablesConfig;
 import io.trino.metadata.Metadata;
 import io.trino.metadata.QualifiedTablePrefix;
 import io.trino.node.InternalNode;
@@ -39,7 +41,10 @@ import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -49,6 +54,7 @@ import static io.trino.connector.system.jdbc.FilterUtil.tablePrefix;
 import static io.trino.connector.system.jdbc.FilterUtil.tryGetSingleVarcharValue;
 import static io.trino.metadata.MetadataListing.getRelationTypes;
 import static io.trino.metadata.MetadataListing.listCatalogNames;
+import static io.trino.metadata.MetadataListing.listSchemas;
 import static io.trino.metadata.MetadataUtil.TableMetadataBuilder.tableMetadataBuilder;
 import static io.trino.spi.connector.FixedSplitSource.emptySplitSource;
 import static io.trino.spi.type.VarcharType.VARCHAR;
@@ -77,13 +83,15 @@ public class TableJdbcTable
     private final Metadata metadata;
     private final AccessControl accessControl;
     private final InternalNode currentNode;
+    private final int schemaBatchSize;
 
     @Inject
-    public TableJdbcTable(Metadata metadata, AccessControl accessControl, InternalNode currentNode)
+    public TableJdbcTable(Metadata metadata, AccessControl accessControl, InternalNode currentNode, SystemTablesConfig config)
     {
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.accessControl = requireNonNull(accessControl, "accessControl is null");
         this.currentNode = requireNonNull(currentNode, "currentNode is null");
+        this.schemaBatchSize = config.getJdbcSchemaBatchSize();
     }
 
     @Override
@@ -122,15 +130,105 @@ public class TableJdbcTable
         }
 
         String catalog = systemSplit.getCatalogName().orElseThrow();
-        QualifiedTablePrefix prefix = tablePrefix(catalog, schemaFilter, tableFilter);
 
-        getRelationTypes(session, metadata, accessControl, prefix).forEach((name, type) -> {
+        // NEW: Schema-level pagination implementation
+        if (schemaFilter.isPresent()) {
+            // If specific schema requested, process directly (no pagination needed)
+            QualifiedTablePrefix prefix = tablePrefix(catalog, schemaFilter, tableFilter);
+            processSchemaBatch(session, metadata, accessControl, prefix, table, includeTables, includeViews);
+        }
+        else {
+            // Process all schemas in batches to reduce OPA load
+            List<String> allSchemas = listAllAccessibleSchemas(session, metadata, accessControl, catalog);
+            List<List<String>> schemaBatches = partitionSchemas(allSchemas, schemaBatchSize);
+            
+            for (List<String> schemaBatch : schemaBatches) {
+                processSchemaBatch(session, metadata, accessControl, catalog, schemaBatch, tableFilter, 
+                                 table, includeTables, includeViews);
+            }
+        }
+
+        return table.build().cursor();
+    }
+
+    /**
+     * Process a single schema batch, applying access control to all tables in the batch
+     */
+    private void processSchemaBatch(
+            Session session,
+            Metadata metadata,
+            AccessControl accessControl,
+            String catalog,
+            List<String> schemas,
+            Optional<String> tableFilter,
+            InMemoryRecordSet.Builder table,
+            boolean includeTables,
+            boolean includeViews)
+    {
+        // Collect all tables from this batch of schemas
+        Map<SchemaTableName, RelationType> batchTables = new HashMap<>();
+        
+        for (String schema : schemas) {
+            QualifiedTablePrefix prefix = tableFilter.isPresent() 
+                ? tablePrefix(catalog, Optional.of(schema), tableFilter)
+                : tablePrefix(catalog, Optional.of(schema), Optional.empty());
+            
+            Map<SchemaTableName, RelationType> schemaTables = getRelationTypes(session, metadata, accessControl, prefix);
+            batchTables.putAll(schemaTables);
+        }
+
+        // Add all allowed tables from this batch to the result
+        batchTables.forEach((name, type) -> {
             boolean isView = type == RelationType.VIEW;
             if ((includeTables && !isView) || (includeViews && isView)) {
                 table.addRow(tableRow(catalog, name, isView ? "VIEW" : "TABLE"));
             }
         });
-        return table.build().cursor();
+    }
+
+    /**
+     * Process a single schema (for specific schema filter case)
+     */
+    private void processSchemaBatch(
+            Session session,
+            Metadata metadata,
+            AccessControl accessControl,
+            QualifiedTablePrefix prefix,
+            InMemoryRecordSet.Builder table,
+            boolean includeTables,
+            boolean includeViews)
+    {
+        getRelationTypes(session, metadata, accessControl, prefix).forEach((name, type) -> {
+            boolean isView = type == RelationType.VIEW;
+            if ((includeTables && !isView) || (includeViews && isView)) {
+                table.addRow(tableRow(prefix.getCatalogName(), name, isView ? "VIEW" : "TABLE"));
+            }
+        });
+    }
+
+    /**
+     * Get list of all accessible schemas for pagination
+     */
+    private List<String> listAllAccessibleSchemas(
+            Session session,
+            Metadata metadata,
+            AccessControl accessControl,
+            String catalog)
+    {
+        return listSchemas(session, metadata, accessControl, catalog);
+    }
+
+    /**
+     * Partition schemas into batches for processing
+     */
+    private List<List<String>> partitionSchemas(List<String> schemas, int batchSize)
+    {
+        List<List<String>> batches = new ArrayList<>();
+        for (int i = 0; i < schemas.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, schemas.size());
+            batches.add(ImmutableList.copyOf(schemas.subList(i, end)));
+        }
+        return batches;
     }
 
     @Override
